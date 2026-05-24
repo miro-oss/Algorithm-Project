@@ -31,11 +31,13 @@ using u64 = uint64_t;
  *    이론적 보장은 없지만, 25× coverage에서는 충분히 동작함.
  *    민감도를 높이려면 K=11,W=5 또는 MIN_CHAIN=1로 조정.
  * ═══════════════════════════════════════════ */
+
 constexpr int K         = 11;
 constexpr int W         = 5;
 constexpr int D         = 2;
-constexpr int TOP_K     = 10;
+constexpr int TOP_K     = 50;
 constexpr int MIN_CHAIN = 1;
+constexpr int SEARCH_RADIUS = D;
 
 /* ──── 인코딩 / 디코딩 ──── */
 int ENC[256];
@@ -159,56 +161,64 @@ vector<int> chain_seeds(const vector<Hit>& hits) {
  *  Peq[c] : read에서 문자 c가 등장하는 위치 bit mask
  *  score  : 현재까지의 edit distance
  *
- *  후보 영역 [ref_start - D, ref_start + L + D) 구간만 스캔
+ *  각 chain 후보 rs 주변에서 가능한 시작점 st를 검사한다.
+ *  매 시작점마다 Myers 상태를 새로 초기화하여 read와
+ *  reference[st : st + L]의 global edit distance를 계산한다.
  * ═══════════════════════════════════════════ */
 
 struct Match { int pos, score; };
+
+int myers_distance_at(const string& ref, int st, int L,
+                      const array<u64, 4>& Peq, u64 top, u64 mask) {
+    u64 Pv = mask, Mv = 0;
+    int sc = L;
+
+    for (int j = 0; j < L; j++) {
+        u64 Eq = Peq[enc(ref[st + j])];
+
+        u64 Xv = Eq | Mv;
+        u64 Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+        u64 Ph = Mv | ~(Xh | Pv);
+        u64 Mh = Pv & Xh;
+
+        Ph &= mask;
+        Mh &= mask;
+
+        if      (Ph & top) sc++;
+        else if (Mh & top) sc--;
+
+        Ph = ((Ph << 1) | 1ULL) & mask;
+        Mh = (Mh << 1)          & mask;
+        Pv = (Mh | ~(Xv | Ph))  & mask;
+        Mv = (Ph & Xv)          & mask;
+    }
+
+    return sc;
+}
 
 vector<Match> myers_verify(const string& ref, const string& read,
                            const vector<int>& cands, int d) {
     int L    = (int)read.size();
     int rlen = (int)ref.size();
+    if (L == 0 || L > 64 || rlen < L) return {};
+
     u64 top  = 1ULL << (L - 1);
-    u64 mask = (1ULL << L) - 1;
+    u64 mask = (L == 64) ? ~u64{0} : (1ULL << L) - 1;
 
     // Peq 전처리 — read의 각 문자 위치를 bit mask로 기록
-    u64 Peq[4] = {};
+    array<u64, 4> Peq{};
     for (int i = 0; i < L; i++)
         Peq[enc(read[i])] |= 1ULL << i;
 
     vector<Match> res;
 
     for (int rs : cands) {
-        int lo = max(0, rs - d);
-        int hi = min(rlen, rs + L + d);
-
-        u64 Pv = mask, Mv = 0;
-        int sc = L;
-
-        for (int j = lo; j < hi; j++) {
-            u64 Eq = Peq[enc(ref[j])];
-
-            u64 Xv = Eq | Mv;
-            u64 Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
-            u64 Ph = Mv | ~(Xh | Pv);
-            u64 Mh = Pv & Xh;
-
-            Ph &= mask;
-            Mh &= mask;
-
-            if      (Ph & top) sc++;
-            else if (Mh & top) sc--;
-
-            Ph = ((Ph << 1) | 1ULL) & mask;
-            Mh = (Mh << 1)          & mask;
-            Pv = Mh | ~(Xv | Ph);
-            Mv = Ph & Xv;
-            Pv &= mask;
-            Mv &= mask;
-
+        int lo = max(0, rs - SEARCH_RADIUS);
+        int hi = min(rlen - L, rs + SEARCH_RADIUS);
+        for (int st = lo; st <= hi; st++) {
+            int sc = myers_distance_at(ref, st, L, Peq, top, mask);
             if (sc <= d) {
-                res.push_back({j - L + 1, sc});
-                break;
+                res.push_back({st, sc});
             }
         }
     }
